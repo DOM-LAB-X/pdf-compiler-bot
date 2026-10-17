@@ -23,6 +23,8 @@ Run **`/pdf panel`** once in a channel. It posts a panel with five buttons that 
 | ⚙️ **Options** | Quality, label position, label color and font. Set quality *before* adding photos so they're pre-processed at it |
 | 🗑️ **Clear** | Starts over |
 
+When the PDF is posted it has a 🗑️ **Dismiss** button (only the person who made it can use it). Unless **Keep** is ticked, your pile is cleared and the chat is tidied: your photo-only messages and the bot's "Added" replies are deleted, so you can start the next batch right away. Messages that also have text or other files are left alone. Deleting your messages needs the bot's **Manage Messages** permission (Server Settings → Roles → the bot's role). Without it, or in DMs, only the bot's own replies are removed.
+
 Panels posted by an older version update themselves to the new buttons the first time someone clicks one.
 
 Each person has their own pile, so several people can use the same panel. Your last choices are remembered.
@@ -46,7 +48,7 @@ Each person has their own pile. A pile is forgotten after 12 idle hours or when 
 1. Go to https://discord.com/developers/applications → **New Application**.
 2. **Bot** tab → **Reset Token** → copy the token.
 3. **Bot** tab → turn on **Message Content Intent** → Save. The bot can't see photos in normal messages without it.
-4. **OAuth2 → URL Generator**: check `bot` + `applications.commands`. Under bot permissions check *Send Messages, Read Message History, Attach Files, View Channels*. Open the generated URL and add the bot to your server.
+4. **OAuth2 → URL Generator**: check `bot` + `applications.commands`. Under bot permissions check *Send Messages, Read Message History, Attach Files, View Channels, Manage Messages* (Manage Messages is only for tidying up photo messages after a PDF). Open the generated URL and add the bot to your server.
 5. (Optional) To get your server ID for instant command sync: Discord Settings → Advanced → Developer Mode, then right-click the server → Copy Server ID.
 
 ## Run it on the Windows VM

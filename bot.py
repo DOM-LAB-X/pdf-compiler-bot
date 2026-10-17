@@ -51,6 +51,7 @@ class Session:
     channels: set[int] = field(default_factory=set)  # channels where /pdf start was run
     touched: float = field(default_factory=time.time)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    chat: list[discord.Message] = field(default_factory=list)  # photo messages + "Added" replies, tidied up after the PDF
 
 sessions: dict[int, Session] = {}
 
@@ -72,7 +73,8 @@ def drop_session(user_id: int, keep_channels: bool = True):
 def plural(n: int, word: str = "photo") -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
 
-async def add_attachments(user: discord.abc.User, attachments: list[discord.Attachment], when: datetime):
+async def add_attachments(user: discord.abc.User, attachments: list[discord.Attachment], when: datetime,
+                          message: discord.Message | None = None):
     s = get_session(user.id)
     added, skipped = 0, []
     async with s.lock:
@@ -88,6 +90,8 @@ async def add_attachments(user: discord.abc.User, attachments: list[discord.Atta
             s.photos.append(photo)
             photo.prep = asyncio.create_task(prepare(photo, get_prefs(user.id)))
             added += 1
+        if message and added and not skipped and not message.content.strip():
+            s.chat.append(message)  # only photos in it, so it's safe to delete once they're in the PDF
     return added, skipped, len(s.photos)
 
 
@@ -153,6 +157,7 @@ class Bot(discord.Client):
 
     async def setup_hook(self):
         self.add_view(PanelView())  # panel buttons keep working after a restart
+        self.add_view(ResultView())
         if GUILD_ID:
             guild = discord.Object(int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -184,9 +189,10 @@ async def on_message(msg: discord.Message):
     )
     if not collecting:
         return
-    added, skipped, total = await add_attachments(msg.author, msg.attachments, msg.created_at)
+    added, skipped, total = await add_attachments(msg.author, msg.attachments, msg.created_at, msg)
     if added or skipped:
-        await msg.reply(added_message(added, skipped, total), mention_author=False, silent=True)
+        reply = await msg.reply(added_message(added, skipped, total), mention_author=False, silent=True)
+        get_session(msg.author.id).chat.append(reply)
 
 # Right-click / long-press a message → Apps → "Add photos to PDF"
 @client.tree.context_menu(name="Add photos to PDF")
@@ -413,7 +419,7 @@ async def generate(inter: discord.Interaction, s: Session, opts: pdfmaker.Option
         except Exception as e:
             log.exception("PDF build failed")
             ticker.cancel()
-            return await inter.edit_original_response(content=f"❌ Something went wrong: `{e}`")
+            return await inter.edit_original_response(content=f"❌ Something went wrong: `{e}`", view=ResultView())
         ticker.cancel()
 
         summary = f"✅ **{name}**: {plural(len(photos), 'page')}"
@@ -421,15 +427,59 @@ async def generate(inter: discord.Interaction, s: Session, opts: pdfmaker.Option
             summary += f", labeled “{' / '.join(label_lines)}”"
         if notes:
             summary += "\n" + "\n".join(f"-# {n}" for n in notes)
+        chat = []
         if not keep:
+            chat = s.chat
             drop_session(inter.user.id)
         else:
             summary += f"\n-# Photos kept ({len(s.photos)}). `/pdf clear` when done."
 
     first, *rest = files
-    await inter.edit_original_response(content=summary, attachments=[first])
+    await inter.edit_original_response(content=summary, attachments=[first], view=ResultView())
     for f in rest:
-        await inter.followup.send(file=f)
+        await inter.followup.send(file=f, view=ResultView())
+    if chat:
+        asyncio.create_task(tidy_chat(chat))
+
+
+async def tidy_chat(msgs: list[discord.Message]):
+    """After the PDF is sent: delete the photo messages and the bot's "Added" replies so the chat is clean.
+    In servers this needs the bot's Manage Messages permission; without it (and in DMs) only the bot's replies go."""
+    by_channel: dict[int, list[discord.Message]] = {}
+    for m in msgs:
+        by_channel.setdefault(m.channel.id, []).append(m)
+    for ms in by_channel.values():
+        ch = ms[0].channel
+        if isinstance(ch, discord.abc.GuildChannel | discord.Thread):
+            try:
+                for i in range(0, len(ms), 100):
+                    await ch.delete_messages(ms[i:i + 100])
+                continue
+            except discord.HTTPException:
+                pass  # no Manage Messages, or messages older than 14 days: try one by one
+        for m in ms:
+            try:
+                await m.delete()
+            except discord.HTTPException:
+                pass
+
+
+class ResultView(discord.ui.View):
+    """Dismiss button on the finished PDF. Persistent: works after a restart too."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Dismiss", emoji="🗑️", style=discord.ButtonStyle.secondary, custom_id="pdfresult:dismiss")
+    async def dismiss(self, inter: discord.Interaction, _):
+        owner = inter.message.interaction_metadata.user.id if inter.message and inter.message.interaction_metadata else None
+        if owner and owner != inter.user.id:
+            return await inter.response.send_message("Only the person who made this PDF can dismiss it.", ephemeral=True)
+        await inter.response.defer()
+        try:
+            await inter.delete_original_response()
+        except discord.HTTPException:
+            await inter.message.delete()
 
 async def build_within_limit(photos, opts, name, limit, state, notes) -> list[discord.File]:
     """Build the PDF. If it's over Discord's upload limit, drop the size preset, then split into parts."""
@@ -750,7 +800,8 @@ class NameModal(discord.ui.Modal, title="Name your PDF"):
                                        description="Each line becomes a line in the label box", component=self.label))
         self.add_item(discord.ui.Label(text="Page layout", component=self.page))
         self.add_item(discord.ui.Label(text="Page order", component=self.sort))
-        self.add_item(discord.ui.Label(text="Keep my photos after making it", component=self.keep))
+        self.add_item(discord.ui.Label(text="Keep my photos after making it", component=self.keep,
+                                       description="Otherwise they're cleared and your photo messages are tidied away"))
 
     async def on_submit(self, inter: discord.Interaction):
         s = sessions.get(inter.user.id)
