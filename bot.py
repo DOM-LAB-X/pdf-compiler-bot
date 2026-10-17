@@ -23,6 +23,7 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: sync commands to one server instan
 SESSION_TTL = float(os.getenv("SESSION_TTL_HOURS", "12")) * 3600
 MAX_PHOTOS = int(os.getenv("MAX_PHOTOS", "300"))
 AUTO_CHANNELS = {int(x) for x in re.split(r"[,\s]+", os.getenv("AUTO_COLLECT_CHANNELS", "")) if x}
+WORKERS = int(os.getenv("PROCESS_WORKERS", "4"))  # photos processed at the same time
 
 log = logging.getLogger("pdf-compiler-bot")
 VERSION = (Path(__file__).parent / "VERSION").read_text().strip() if (Path(__file__).parent / "VERSION").exists() else "dev"
@@ -82,7 +83,7 @@ async def add_attachments(user: discord.abc.User, attachments: list[discord.Atta
 def added_message(added: int, skipped: list[str], total: int) -> str:
     parts = []
     if added:
-        parts.append(f"📥 Added {plural(added)}. **{total}** in your pile. Use `/pdf make` when you're ready.")
+        parts.append(f"📥 Added {plural(added)}. **{total}** in your pile. Hit **Generate PDF** (or `/pdf make`) when you're ready.")
     if skipped:
         parts.append("⚠️ Skipped: " + ", ".join(skipped[:10]) + (" …" if len(skipped) > 10 else ""))
     return "\n".join(parts) or "Nothing to add."
@@ -236,7 +237,7 @@ async def pdf_clear(inter: discord.Interaction):
 async def pdf_help(inter: discord.Interaction):
     await inter.response.send_message(
         "**Photos → PDF**\n"
-        "**Easiest:** `/pdf panel` posts a button panel: Upload Photos → Generate PDF → name it.\n\n"
+        "**Easiest:** `/pdf panel` posts a button panel: Add Photos → drop photos in chat → Generate PDF → name it.\n\n"
         "**Or with commands:**\n"
         "1. DM me photos, or run `/pdf start` in a channel and post them there. You can also long-press "
         "any message → **Apps → Add photos to PDF**.\n"
@@ -256,11 +257,15 @@ async def fetch(p: Photo) -> bytes | None:
 
 async def resolve_dates(photos: list[Photo]) -> dict[str, int]:
     use_ocr = pdfmaker.ocr_available()
-    for p in photos:
-        if p.date_source is None:
+    sem = asyncio.Semaphore(WORKERS)
+
+    async def one(p: Photo):
+        async with sem:
             data = await fetch(p)
             d, src = await asyncio.to_thread(pdfmaker.find_date, data, use_ocr) if data else (None, None)
             p.taken_at, p.date_source = (d, src) if d else (p.uploaded_at.replace(tzinfo=None), "upload")
+
+    await asyncio.gather(*(one(p) for p in photos if p.date_source is None))
     counts: dict[str, int] = {}
     for p in photos:
         counts[p.date_source] = counts.get(p.date_source, 0) + 1
@@ -384,14 +389,23 @@ async def build_within_limit(photos, opts, name, limit, state, notes) -> list[di
 
     for size in sizes:
         opts.size = size
-        pages, failed = [], []
-        for i, p in enumerate(photos, 1):
-            state["text"] = f"⏳ Processing photo {i}/{len(photos)} ({size})…"
-            data = await fetch(p)  # in memory only, dropped right after this photo is done
-            try:
-                pages.append(await asyncio.to_thread(pdfmaker.render_page, data, opts))
-            except Exception:
-                failed.append(p.name)
+        sem, done = asyncio.Semaphore(WORKERS), 0
+
+        async def one(p: Photo, size=size):
+            nonlocal done
+            async with sem:
+                data = await fetch(p)  # in memory only, dropped right after this photo is done
+                try:
+                    return await asyncio.to_thread(pdfmaker.render_page, data, opts)
+                except Exception:
+                    return None
+                finally:
+                    done += 1
+                    state["text"] = f"⏳ Processing photo {done}/{len(photos)} ({size})…"
+
+        results = await asyncio.gather(*(one(p) for p in photos))  # keeps page order
+        pages = [r for r in results if r]
+        failed = [p.name for p, r in zip(photos, results) if r is None]
         if not pages:
             raise RuntimeError("none of the photos could be read (were the messages deleted?)")
         total = len(pages)
@@ -459,7 +473,7 @@ def panel_embed() -> discord.Embed:
         color=ACCENT,
         description=(
             "Turn your photos into one PDF in **three steps**:\n"
-            "`01` 📤 **Upload Photos**: up to 30 at a time, any format (HEIC too). Repeat to add more.\n"
+            "`01` 📤 **Add Photos**, then drop your photos in the chat. Any format (HEIC too), as many as you want\n"
             "`02` 🗂️ **My Photos**: check the order, remove or move photos\n"
             "`03` 📄 **Generate PDF**: pick page options, name it, done\n\n"
             "-# You can also DM me photos. Photos are never saved, only kept as Discord links until you generate."
@@ -476,9 +490,15 @@ class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Upload Photos", emoji="📤", style=discord.ButtonStyle.success, custom_id="pdfpanel:upload")
+    @discord.ui.button(label="Add Photos", emoji="📤", style=discord.ButtonStyle.success, custom_id="pdfpanel:upload")
     async def upload(self, inter: discord.Interaction, _):
-        await inter.response.send_modal(UploadModal())
+        s = get_session(inter.user.id)
+        s.channels.add(inter.channel_id)  # collect what this user posts here (Discord's normal upload is much faster)
+        have = f" You have **{plural(len(s.photos))}** so far." if s.photos else ""
+        await inter.response.send_message(
+            f"📸 **Drop your photos right here in the chat**: drag them in or paste them, up to 10 per message, "
+            f"as many messages as you want. I'll confirm each batch.{have}\nThen hit **Generate PDF**.",
+            view=AddPhotosView(), ephemeral=True)
 
     @discord.ui.button(label="My Photos", emoji="🗂️", style=discord.ButtonStyle.primary, custom_id="pdfpanel:photos")
     async def photos(self, inter: discord.Interaction, _):
@@ -503,6 +523,22 @@ class PanelView(discord.ui.View):
         await inter.response.send_message("🧹 Cleared your photos.", ephemeral=True)
 
 
+class AddPhotosView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Generate PDF", emoji="📄", style=discord.ButtonStyle.success)
+    async def gen(self, inter: discord.Interaction, _):
+        s = sessions.get(inter.user.id)
+        if not s or not s.photos:
+            return await inter.response.send_message("No photos yet. Drop some in the chat first.", ephemeral=True)
+        await inter.response.send_message(settings_text(s), view=SettingsView(inter.user.id), ephemeral=True)
+
+    @discord.ui.button(label="Use upload form instead", emoji="🗃️", style=discord.ButtonStyle.secondary)
+    async def form(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(UploadModal())
+
+
 class UploadModal(discord.ui.Modal, title="Upload photos"):
     def __init__(self):
         super().__init__()
@@ -517,7 +553,7 @@ class UploadModal(discord.ui.Modal, title="Upload photos"):
         files = [a for up in self.uploads for a in up.values]
         await inter.response.defer(ephemeral=True, thinking=True)
         added, skipped, total = await add_attachments(inter.user, files, discord.utils.utcnow())
-        await inter.followup.send(added_message(added, skipped, total).replace("Use `/pdf make`", "Hit **Generate PDF**"),
+        await inter.followup.send(added_message(added, skipped, total),
                                   view=PanelView(), ephemeral=True)
 
 

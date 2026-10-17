@@ -17,7 +17,7 @@ Run **`/pdf panel`** once in a channel. It posts a panel with four buttons that 
 
 | Button | What it does |
 |---|---|
-| 📤 **Upload Photos** | Opens a form where you pick up to 30 photos at a time. Press it again to add more |
+| 📤 **Add Photos** | Turns on collecting in that channel. Drag or paste your photos into the chat (fastest). There's also a **Use upload form instead** button |
 | 🗂️ **My Photos** | Shows your photos in page order, with **Remove…** and **Move…** |
 | 📄 **Generate PDF** | Dropdowns for layout, quality, page order and label position, plus label color and font buttons. **Next** asks for the file name and the label text (multi-line), then builds the PDF |
 | 🗑️ **Clear** | Starts over |
