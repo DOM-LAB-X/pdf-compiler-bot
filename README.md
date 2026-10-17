@@ -11,6 +11,21 @@ Send photos to the bot in Discord and get back one letter-size PDF. This is the 
 
 ## Using it
 
+### Button panel (easiest)
+
+Run **`/pdf panel`** once in a channel. It posts a panel with four buttons that anyone in the channel can use:
+
+| Button | What it does |
+|---|---|
+| 📤 **Upload Photos** | Opens a form where you pick up to 30 photos at a time. Press it again to add more |
+| 🗂️ **My Photos** | Shows your photos in page order, with **Remove…** and **Move…** |
+| 📄 **Generate PDF** | Dropdowns for layout, quality, page order and label position, plus label color and font buttons. **Next** asks for the file name and the label text (multi-line), then builds the PDF |
+| 🗑️ **Clear** | Starts over |
+
+Each person has their own pile, so several people can use the same panel. Your last choices are remembered.
+
+### Commands
+
 | | |
 |---|---|
 | **DM the bot photos** | They're collected automatically, up to 10 per message, across as many messages as you want |

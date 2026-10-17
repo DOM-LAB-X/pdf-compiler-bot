@@ -112,6 +112,7 @@ class Bot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        self.add_view(PanelView())  # panel buttons keep working after a restart
         if GUILD_ID:
             guild = discord.Object(int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -183,6 +184,10 @@ async def pdf_list(inter: discord.Interaction):
     s = sessions.get(inter.user.id)
     if not s or not s.photos:
         return await inter.response.send_message("Your pile is empty. Post some photos first.", ephemeral=True)
+    await inter.response.send_message(list_text(s), ephemeral=True)
+
+
+def list_text(s: Session) -> str:
     icons = {"timemark": "⏱", "exif": "📷", "upload": "📤"}
     lines = []
     for i, p in enumerate(s.photos, 1):
@@ -191,7 +196,7 @@ async def pdf_list(inter: discord.Interaction):
     text = f"**{plural(len(s.photos))}**\n" + "\n".join(lines)
     if len(text) > 1900:
         text = text[:1900].rsplit("\n", 1)[0] + "\n…"
-    await inter.response.send_message(text, ephemeral=True)
+    return text
 
 @pdf.command(name="remove", description="Remove photos by number, e.g. 3 or 2,5,7 or 4-6")
 @app_commands.describe(numbers="Photo numbers from /pdf list")
@@ -231,6 +236,8 @@ async def pdf_clear(inter: discord.Interaction):
 async def pdf_help(inter: discord.Interaction):
     await inter.response.send_message(
         "**Photos → PDF**\n"
+        "**Easiest:** `/pdf panel` posts a button panel: Upload Photos → Generate PDF → name it.\n\n"
+        "**Or with commands:**\n"
         "1. DM me photos, or run `/pdf start` in a channel and post them there. You can also long-press "
         "any message → **Apps → Add photos to PDF**.\n"
         "2. `/pdf list` shows the order. Fix it with `/pdf move` / `/pdf remove`, or use `sort` in `/pdf make`.\n"
@@ -321,7 +328,13 @@ async def pdf_make(
     if s.lock.locked():
         return await inter.response.send_message("Already working on one, hang on.", ephemeral=True)
     await inter.response.defer(thinking=True)
+    opts = pdfmaker.Options(orientation, fit, size, label, label_position, label_color, label_font)
+    await generate(inter, s, opts, filename, sort, keep)
 
+
+async def generate(inter: discord.Interaction, s: Session, opts: pdfmaker.Options, filename: str, sort: str, keep: bool):
+    """Build and send the PDF. The interaction must already be deferred."""
+    label = opts.label
     async with s.lock:
         photos = list(s.photos)
         notes = []
@@ -337,7 +350,6 @@ async def pdf_make(
             notes.append(("Sorted oldest → newest" if sort == "asc" else "Sorted newest → oldest")
                          + " (" + ", ".join(f"{n} by {names[k]}" for k, n in counts.items()) + ")")
 
-        opts = pdfmaker.Options(orientation, fit, size, label, label_position, label_color, label_font)
         name = pdfmaker.safe_filename(filename)
         limit = max(1_000_000, inter.filesize_limit - 256 * 1024)  # headroom for upload overhead
 
@@ -412,6 +424,240 @@ async def build_within_limit(photos, opts, name, limit, state, notes) -> list[di
     stem = name[:-4]
     return [discord.File(io.BytesIO(b), filename=f"{stem}_part{i}of{len(built)}.pdf")
             for i, b in enumerate(built, 1)]
+
+# ─────────────────────────────────────────────
+#   Button panel + forms  (/pdf panel)
+# ─────────────────────────────────────────────
+ACCENT = discord.Color.from_str("#e54d2e")
+PAGE_CHOICES = {
+    "portrait|fit": "Portrait · Fit (whole photo, margins)",
+    "portrait|fill": "Portrait · Fill (edges may crop)",
+    "portrait|stretch": "Portrait · Stretch (may distort)",
+    "landscape|fit": "Landscape · Fit (whole photo, margins)",
+    "landscape|fill": "Landscape · Fill (edges may crop)",
+    "landscape|stretch": "Landscape · Stretch (may distort)",
+}
+SIZE_CHOICES = {"small": "Small file (1200px)", "balanced": "Balanced (1800px)", "original": "Original quality"}
+SORT_CHOICES = {"upload": "Order I uploaded them", "asc": "Date taken: oldest → newest", "desc": "Date taken: newest → oldest"}
+POSITION_CHOICES = {"tl": "Label top left ↖", "tr": "Label top right ↗", "ml": "Label middle left ←",
+                    "mr": "Label middle right →", "bl": "Label bottom left ↙", "br": "Label bottom right ↘"}
+FONT_NAMES = {"sans": "Arial", "serif": "Times"}
+
+# Last-used choices per user (kept after a PDF is made, unlike the photos)
+prefs: dict[int, dict] = {}
+DEFAULT_PREFS = {"page": "portrait|fit", "size": "balanced", "sort": "upload", "label_position": "tl",
+                 "label_color": "red", "label_font": "sans", "filename": "photos", "label": ""}
+
+
+def get_prefs(user_id: int) -> dict:
+    return prefs.setdefault(user_id, dict(DEFAULT_PREFS))
+
+
+def panel_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="📄 PDF Compiler",
+        color=ACCENT,
+        description=(
+            "Turn your photos into one PDF in **three steps**:\n"
+            "`01` 📤 **Upload Photos**: up to 30 at a time, any format (HEIC too). Repeat to add more.\n"
+            "`02` 🗂️ **My Photos**: check the order, remove or move photos\n"
+            "`03` 📄 **Generate PDF**: pick page options, name it, done\n\n"
+            "-# You can also DM me photos. Photos are never saved, only kept as Discord links until you generate."
+        ),
+    )
+    if client.user:
+        e.set_thumbnail(url=client.user.display_avatar.url)
+    return e
+
+
+class PanelView(discord.ui.View):
+    """The main buttons. Persistent: keeps working after the bot restarts."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Upload Photos", emoji="📤", style=discord.ButtonStyle.success, custom_id="pdfpanel:upload")
+    async def upload(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(UploadModal())
+
+    @discord.ui.button(label="My Photos", emoji="🗂️", style=discord.ButtonStyle.primary, custom_id="pdfpanel:photos")
+    async def photos(self, inter: discord.Interaction, _):
+        s = sessions.get(inter.user.id)
+        if not s or not s.photos:
+            return await inter.response.send_message("You haven't uploaded any photos yet.", view=PanelView(), ephemeral=True)
+        await inter.response.send_message(list_text(s), view=PhotosView(), ephemeral=True)
+
+    @discord.ui.button(label="Generate PDF", emoji="📄", style=discord.ButtonStyle.success, custom_id="pdfpanel:generate")
+    async def generate_btn(self, inter: discord.Interaction, _):
+        s = sessions.get(inter.user.id)
+        if not s or not s.photos:
+            return await inter.response.send_message("Upload some photos first.", view=PanelView(), ephemeral=True)
+        await inter.response.send_message(settings_text(s), view=SettingsView(inter.user.id), ephemeral=True)
+
+    @discord.ui.button(label="Clear", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="pdfpanel:clear")
+    async def clear(self, inter: discord.Interaction, _):
+        s = sessions.get(inter.user.id)
+        if s and s.lock.locked():
+            return await inter.response.send_message("A PDF is being made right now, try again in a moment.", ephemeral=True)
+        drop_session(inter.user.id)
+        await inter.response.send_message("🧹 Cleared your photos.", ephemeral=True)
+
+
+class UploadModal(discord.ui.Modal, title="Upload photos"):
+    def __init__(self):
+        super().__init__()
+        self.uploads = [discord.ui.FileUpload(max_values=10, required=(i == 0)) for i in range(3)]
+        for i, up in enumerate(self.uploads):
+            self.add_item(discord.ui.Label(
+                text="Photos" if i == 0 else "More photos (optional)",
+                description="Up to 10 here. JPG, PNG, HEIC, WebP…" if i == 0 else None,
+                component=up))
+
+    async def on_submit(self, inter: discord.Interaction):
+        files = [a for up in self.uploads for a in up.values]
+        await inter.response.defer(ephemeral=True, thinking=True)
+        added, skipped, total = await add_attachments(inter.user, files, discord.utils.utcnow())
+        await inter.followup.send(added_message(added, skipped, total).replace("Use `/pdf make`", "Hit **Generate PDF**"),
+                                  view=PanelView(), ephemeral=True)
+
+
+class PhotosView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Remove…", emoji="➖", style=discord.ButtonStyle.secondary)
+    async def remove(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(RemoveModal())
+
+    @discord.ui.button(label="Move…", emoji="↕️", style=discord.ButtonStyle.secondary)
+    async def move(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(MoveModal())
+
+    @discord.ui.button(label="Generate PDF", emoji="📄", style=discord.ButtonStyle.success)
+    async def gen(self, inter: discord.Interaction, _):
+        s = sessions.get(inter.user.id)
+        if not s or not s.photos:
+            return await inter.response.edit_message(content="No photos left.", view=None)
+        await inter.response.edit_message(content=settings_text(s), view=SettingsView(inter.user.id))
+
+
+class RemoveModal(discord.ui.Modal, title="Remove photos"):
+    numbers = discord.ui.TextInput(label="Photo numbers", placeholder="e.g. 3   or   2,5,7   or   4-6")
+
+    async def on_submit(self, inter: discord.Interaction):
+        s = sessions.get(inter.user.id)
+        if not s or not s.photos:
+            return await inter.response.edit_message(content="No photos left.", view=None)
+        try:
+            idx = parse_numbers(self.numbers.value, len(s.photos))
+        except ValueError as e:
+            return await inter.response.send_message(f"Couldn't read `{e}`.", ephemeral=True)
+        async with s.lock:
+            for i in reversed(idx):
+                s.photos.pop(i)
+        msg = f"🗑️ Removed {plural(len(idx))}.\n" + (list_text(s) if s.photos else "No photos left.")
+        await inter.response.edit_message(content=msg, view=PhotosView() if s.photos else None)
+
+
+class MoveModal(discord.ui.Modal, title="Move a photo"):
+    number = discord.ui.TextInput(label="Photo number", placeholder="e.g. 5", max_length=4)
+    to = discord.ui.TextInput(label="New position", placeholder="e.g. 1", max_length=4)
+
+    async def on_submit(self, inter: discord.Interaction):
+        s = sessions.get(inter.user.id)
+        n = len(s.photos) if s else 0
+        try:
+            a, b = int(self.number.value), int(self.to.value)
+            assert 1 <= a <= n and 1 <= b <= n
+        except (ValueError, AssertionError):
+            return await inter.response.send_message(f"Numbers must be between 1 and {n}.", ephemeral=True)
+        async with s.lock:
+            s.photos.insert(b - 1, s.photos.pop(a - 1))
+        await inter.response.edit_message(content=f"↕️ Moved photo {a} to position {b}.\n" + list_text(s), view=PhotosView())
+
+
+def settings_text(s: Session) -> str:
+    return (f"**Page options**: {plural(len(s.photos))} ready.\n"
+            "Pick your options, then hit **Next** to name the PDF and add a label.")
+
+
+def _select(placeholder: str, choices: dict, current: str, row: int) -> discord.ui.Select:
+    return discord.ui.Select(placeholder=placeholder, row=row, options=[
+        discord.SelectOption(label=label, value=value, default=(value == current)) for value, label in choices.items()])
+
+
+class SettingsView(discord.ui.View):
+    """Dropdowns for the page options. Changes are remembered for next time."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=900)
+        p = get_prefs(user_id)
+        for row, (key, placeholder, choices) in enumerate([
+            ("page", "Page layout", PAGE_CHOICES), ("size", "Quality", SIZE_CHOICES),
+            ("sort", "Page order", SORT_CHOICES), ("label_position", "Label position", POSITION_CHOICES),
+        ]):
+            sel = _select(placeholder, choices, p[key], row)
+            sel.callback = self._on_select(key, sel)
+            self.add_item(sel)
+        self.color_btn.label = f"Label color: {p['label_color'].title()}"
+        self.font_btn.label = f"Font: {FONT_NAMES[p['label_font']]}"
+
+    def _on_select(self, key: str, sel: discord.ui.Select):
+        async def callback(inter: discord.Interaction):
+            get_prefs(inter.user.id)[key] = sel.values[0]
+            await inter.response.edit_message(view=SettingsView(inter.user.id))
+        return callback
+
+    @discord.ui.button(label="Label color", emoji="🎨", style=discord.ButtonStyle.secondary, row=4)
+    async def color_btn(self, inter: discord.Interaction, _):
+        p = get_prefs(inter.user.id)
+        colors = list(pdfmaker.COLORS)
+        p["label_color"] = colors[(colors.index(p["label_color"]) + 1) % len(colors)]
+        await inter.response.edit_message(view=SettingsView(inter.user.id))
+
+    @discord.ui.button(label="Font", emoji="🔤", style=discord.ButtonStyle.secondary, row=4)
+    async def font_btn(self, inter: discord.Interaction, _):
+        p = get_prefs(inter.user.id)
+        p["label_font"] = "serif" if p["label_font"] == "sans" else "sans"
+        await inter.response.edit_message(view=SettingsView(inter.user.id))
+
+    @discord.ui.button(label="Next: name it", emoji="➡️", style=discord.ButtonStyle.success, row=4)
+    async def next_btn(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(NameModal(inter.user.id))
+
+
+class NameModal(discord.ui.Modal, title="Name your PDF"):
+    def __init__(self, user_id: int):
+        super().__init__()
+        p = get_prefs(user_id)
+        self.filename = discord.ui.TextInput(default=p["filename"], max_length=100)
+        self.label = discord.ui.TextInput(
+            style=discord.TextStyle.paragraph, required=False, default=p["label"] or None, max_length=300,
+            placeholder="PO 25OSPC055\n@ KOMO MAI DR.\nTAKEN 4/16/26")
+        self.keep = discord.ui.Checkbox()
+        self.add_item(discord.ui.Label(text="File name", description=".pdf is added for you", component=self.filename))
+        self.add_item(discord.ui.Label(text="Label on every photo (optional)",
+                                       description="Each line becomes a line in the label box", component=self.label))
+        self.add_item(discord.ui.Label(text="Keep my photos after making it", component=self.keep))
+
+    async def on_submit(self, inter: discord.Interaction):
+        s = sessions.get(inter.user.id)
+        if not s or not s.photos:
+            return await inter.response.send_message("Your photos are gone (cleared or expired). Upload them again.", ephemeral=True)
+        if s.lock.locked():
+            return await inter.response.send_message("Already working on one, hang on.", ephemeral=True)
+        p = get_prefs(inter.user.id)
+        p["filename"], p["label"] = self.filename.value.strip() or "photos", self.label.value
+        orientation, fit = p["page"].split("|")
+        opts = pdfmaker.Options(orientation, fit, p["size"], p["label"], p["label_position"], p["label_color"], p["label_font"])
+        await inter.response.defer(thinking=True)
+        await generate(inter, s, opts, p["filename"], p["sort"], bool(self.keep.value))
+
+
+@pdf.command(name="panel", description="Post the PDF Compiler button panel in this channel")
+async def pdf_panel(inter: discord.Interaction):
+    await inter.response.send_message(embed=panel_embed(), view=PanelView())
+
 
 if __name__ == "__main__":
     if not TOKEN:
