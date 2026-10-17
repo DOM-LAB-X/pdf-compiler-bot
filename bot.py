@@ -24,6 +24,7 @@ SESSION_TTL = float(os.getenv("SESSION_TTL_HOURS", "12")) * 3600
 MAX_PHOTOS = int(os.getenv("MAX_PHOTOS", "300"))
 AUTO_CHANNELS = {int(x) for x in re.split(r"[,\s]+", os.getenv("AUTO_COLLECT_CHANNELS", "")) if x}
 WORKERS = int(os.getenv("PROCESS_WORKERS", "4"))  # photos processed at the same time
+CACHE_MB = float(os.getenv("CACHE_MB", "1000"))  # RAM for photos pre-processed while you upload
 
 log = logging.getLogger("pdf-compiler-bot")
 VERSION = (Path(__file__).parent / "VERSION").read_text().strip() if (Path(__file__).parent / "VERSION").exists() else "dev"
@@ -39,6 +40,10 @@ class Photo:
     uploaded_at: datetime
     taken_at: datetime | None = None
     date_source: str | None = None  # timemark | exif | upload | None (not checked yet)
+    # Pre-processed in the background as soon as the photo is added, so Generate is quick (RAM only)
+    base: pdfmaker.Page | None = None  # rendered without a label
+    base_size: str | None = None
+    prep: asyncio.Task | None = None
 
 @dataclass
 class Session:
@@ -58,6 +63,9 @@ def get_session(user_id: int) -> Session:
 
 def drop_session(user_id: int, keep_channels: bool = True):
     s = sessions.pop(user_id, None)
+    for p in s.photos if s else []:
+        if p.prep:
+            p.prep.cancel()
     if s and keep_channels and s.channels:
         get_session(user_id).channels = s.channels
 
@@ -76,14 +84,45 @@ async def add_attachments(user: discord.abc.User, attachments: list[discord.Atta
                 skipped.append(f"{a.filename} (limit is {MAX_PHOTOS} photos)")
                 continue
             display = re.sub(r"\.(heic|heif)$", ".jpg", a.filename, flags=re.I)
-            s.photos.append(Photo(a, display, when))
+            photo = Photo(a, display, when)
+            s.photos.append(photo)
+            photo.prep = asyncio.create_task(prepare(photo, get_prefs(user.id)))
             added += 1
     return added, skipped, len(s.photos)
+
+
+prep_sem = asyncio.Semaphore(WORKERS)
+
+
+def cache_used() -> int:
+    return sum(len(p.base.jpeg) for s in sessions.values() for p in s.photos if p.base)
+
+
+async def prepare(p: Photo, pref: dict):
+    """Download + render one photo in the background right after it's added (with the user's last
+    quality setting) and read its date if they sort by date. Only the small rendered page is kept."""
+    async with prep_sem:
+        data = await fetch(p)
+        if not data:
+            return
+        if pref["sort"] != "upload" and p.date_source is None:
+            set_date(p, *await asyncio.to_thread(pdfmaker.find_date, data, pdfmaker.ocr_available()))
+        if cache_used() < CACHE_MB * 1e6:
+            try:
+                page = await asyncio.to_thread(pdfmaker.render_page, data, pdfmaker.Options(size=pref["size"]))
+            except Exception:
+                return  # tried again (and reported) when the PDF is built
+            if cache_used() + len(page.jpeg) <= CACHE_MB * 1e6:  # re-check: others may have finished meanwhile
+                p.base, p.base_size = page, pref["size"]
+
+
+def set_date(p: Photo, d: datetime | None, src: str | None):
+    p.taken_at, p.date_source = (d, src) if d else (p.uploaded_at.replace(tzinfo=None), "upload")
 
 def added_message(added: int, skipped: list[str], total: int) -> str:
     parts = []
     if added:
-        parts.append(f"📥 Added {plural(added)}. **{total}** in your pile. Hit **Generate PDF** (or `/pdf make`) when you're ready.")
+        parts.append(f"📥 Added {plural(added)}. **{total}** in your pile. When you're done: **Generate PDF** on the panel, or `/pdf stop`.")
     if skipped:
         parts.append("⚠️ Skipped: " + ", ".join(skipped[:10]) + (" …" if len(skipped) > 10 else ""))
     return "\n".join(parts) or "Nothing to add."
@@ -171,14 +210,16 @@ async def pdf_start(inter: discord.Interaction):
     note = f" You already have {plural(len(s.photos))}." if s.photos else ""
     await inter.response.send_message(
         f"📸 I'll grab the photos you post here. Up to 10 per message, any image type (HEIC too).{note}\n"
-        "Then run `/pdf make`. `/pdf stop` stops collecting here.", ephemeral=True)
+        "When you're done, run `/pdf stop`: it asks for a file name and makes the PDF.", ephemeral=True)
 
-@pdf.command(name="stop", description="Stop collecting photos in this channel (your pile is kept)")
+@pdf.command(name="stop", description="Stop collecting here, name the PDF and make it")
 async def pdf_stop(inter: discord.Interaction):
     s = sessions.get(inter.user.id)
     if s:
         s.channels.discard(inter.channel_id)
-    await inter.response.send_message("🛑 Stopped collecting here. Your photos are still saved.", ephemeral=True)
+    if not s or not s.photos:
+        return await inter.response.send_message("🛑 Stopped collecting here. You have no photos yet.", ephemeral=True)
+    await inter.response.send_modal(NameModal(inter.user.id))
 
 @pdf.command(name="list", description="Show the photos in your pile, in page order")
 async def pdf_list(inter: discord.Interaction):
@@ -237,14 +278,16 @@ async def pdf_clear(inter: discord.Interaction):
 async def pdf_help(inter: discord.Interaction):
     await inter.response.send_message(
         "**Photos → PDF**\n"
-        "**Easiest:** `/pdf panel` posts a button panel: Add Photos → drop photos in chat → Generate PDF → name it.\n\n"
-        "**Or with commands:**\n"
-        "1. DM me photos, or run `/pdf start` in a channel and post them there. You can also long-press "
-        "any message → **Apps → Add photos to PDF**.\n"
-        "2. `/pdf list` shows the order. Fix it with `/pdf move` / `/pdf remove`, or use `sort` in `/pdf make`.\n"
-        "3. `/pdf make` builds the PDF. Options: orientation, fit, size, sort by date, a label "
+        "**Quickest:** DM me photos (or `/pdf start` in a channel and post them), then `/pdf stop`. "
+        "It asks for a file name and makes the PDF.\n"
+        "**Buttons:** `/pdf panel` posts a panel: Add Photos → drop photos in chat → Generate PDF → name it.\n\n"
+        "**More commands:**\n"
+        "• Long-press any message → **Apps → Add photos to PDF** to add someone else's photos.\n"
+        "• `/pdf list` shows the order. Fix it with `/pdf move` / `/pdf remove`, or pick a date order in the form.\n"
+        "• `/pdf make` builds the PDF with every option as a command field: orientation, fit, size, sort, a label "
         "(use `|` for new lines, e.g. `PO 25OSPC055 | @ KOMO MAI DR. | TAKEN 4/16/26`).\n"
-        "Your pile is cleared after the PDF is made unless you set `keep: True`.",
+        "Photos are processed while you upload, so the PDF is ready right after you name it. "
+        "Your pile is cleared after the PDF is made unless you tick **Keep** (`keep: True`).",
         ephemeral=True)
 
 async def fetch(p: Photo) -> bytes | None:
@@ -262,8 +305,7 @@ async def resolve_dates(photos: list[Photo]) -> dict[str, int]:
     async def one(p: Photo):
         async with sem:
             data = await fetch(p)
-            d, src = await asyncio.to_thread(pdfmaker.find_date, data, use_ocr) if data else (None, None)
-            p.taken_at, p.date_source = (d, src) if d else (p.uploaded_at.replace(tzinfo=None), "upload")
+            set_date(p, *(await asyncio.to_thread(pdfmaker.find_date, data, use_ocr) if data else (None, None)))
 
     await asyncio.gather(*(one(p) for p in photos if p.date_source is None))
     counts: dict[str, int] = {}
@@ -343,6 +385,12 @@ async def generate(inter: discord.Interaction, s: Session, opts: pdfmaker.Option
     async with s.lock:
         photos = list(s.photos)
         notes = []
+        pending = [p.prep for p in photos if p.prep and not p.prep.done()]
+        if pending:  # still pre-processing the last photos you dropped: let those finish instead of redoing them
+            state = {"text": f"⏳ Processing {plural(len(pending))}…"}
+            ticker = asyncio.create_task(show_progress(inter, state))
+            await asyncio.wait(pending)
+            ticker.cancel()
         if sort != "upload":
             state = {"text": f"⏳ Reading dates from {plural(len(photos))}…"}
             ticker = asyncio.create_task(show_progress(inter, state))
@@ -394,8 +442,13 @@ async def build_within_limit(photos, opts, name, limit, state, notes) -> list[di
         async def one(p: Photo, size=size):
             nonlocal done
             async with sem:
-                data = await fetch(p)  # in memory only, dropped right after this photo is done
                 try:
+                    if p.base and p.base_size == size and not opts.label:
+                        return p.base  # pre-processed while uploading: nothing left to do
+                    if p.base and pdfmaker.can_derive(p.base_size, size):
+                        data = p.base.jpeg  # add the label / shrink from the pre-processed page, no download
+                    else:
+                        data = await fetch(p)  # in memory only, dropped right after this photo is done
                     return await asyncio.to_thread(pdfmaker.render_page, data, opts)
                 except Exception:
                     return None
@@ -472,11 +525,11 @@ def panel_embed() -> discord.Embed:
         title="📄 PDF Compiler",
         color=ACCENT,
         description=(
-            "Turn your photos into one PDF in **three steps**:\n"
+            "Turn your photos into one PDF in **two steps**:\n"
             "`01` 📤 **Add Photos**, then drop your photos in the chat. Any format (HEIC too), as many as you want\n"
-            "`02` 🗂️ **My Photos**: check the order, remove or move photos\n"
-            "`03` 📄 **Generate PDF**: pick page options, name it, done\n\n"
-            "-# You can also DM me photos. Photos are never saved, only kept as Discord links until you generate."
+            "`02` 📄 **Generate PDF**: name it, pick the layout, done\n\n"
+            "🗂️ **My Photos** to check the order · ⚙️ **Options** for quality and label style\n"
+            "-# You can also DM me photos. Photos are never saved to disk, only held in memory until you generate."
         ),
     )
     if client.user:
@@ -489,6 +542,16 @@ class PanelView(discord.ui.View):
 
     def __init__(self):
         super().__init__(timeout=None)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        # A panel posted by an older version updates itself to the current buttons on first click
+        msg = inter.message
+        if msg and not msg.flags.ephemeral:
+            current = [(b.custom_id, b.label) for b in self.children]
+            posted = [(c.custom_id, c.label) for row in msg.components for c in getattr(row, "children", [])]
+            if posted != current:
+                asyncio.create_task(update_panel(msg))
+        return True
 
     @discord.ui.button(label="Add Photos", emoji="📤", style=discord.ButtonStyle.success, custom_id="pdfpanel:upload")
     async def upload(self, inter: discord.Interaction, _):
@@ -509,10 +572,11 @@ class PanelView(discord.ui.View):
 
     @discord.ui.button(label="Generate PDF", emoji="📄", style=discord.ButtonStyle.success, custom_id="pdfpanel:generate")
     async def generate_btn(self, inter: discord.Interaction, _):
-        s = sessions.get(inter.user.id)
-        if not s or not s.photos:
-            return await inter.response.send_message("Upload some photos first.", view=PanelView(), ephemeral=True)
-        await inter.response.send_message(settings_text(s), view=SettingsView(inter.user.id), ephemeral=True)
+        await open_name_form(inter)
+
+    @discord.ui.button(label="Options", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="pdfpanel:options")
+    async def options(self, inter: discord.Interaction, _):
+        await inter.response.send_message(settings_text(), view=SettingsView(inter.user.id), ephemeral=True)
 
     @discord.ui.button(label="Clear", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="pdfpanel:clear")
     async def clear(self, inter: discord.Interaction, _):
@@ -523,16 +587,28 @@ class PanelView(discord.ui.View):
         await inter.response.send_message("🧹 Cleared your photos.", ephemeral=True)
 
 
+async def update_panel(msg: discord.Message):
+    try:
+        await msg.edit(embed=panel_embed(), view=PanelView())
+    except discord.HTTPException:
+        pass
+
+
+async def open_name_form(inter: discord.Interaction):
+    """Generate PDF: straight to the name form (page options are in it, the rest are remembered)."""
+    s = sessions.get(inter.user.id)
+    if not s or not s.photos:
+        return await inter.response.send_message("No photos yet. Hit **Add Photos** and drop some in the chat first.", ephemeral=True)
+    await inter.response.send_modal(NameModal(inter.user.id))
+
+
 class AddPhotosView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
 
     @discord.ui.button(label="Generate PDF", emoji="📄", style=discord.ButtonStyle.success)
     async def gen(self, inter: discord.Interaction, _):
-        s = sessions.get(inter.user.id)
-        if not s or not s.photos:
-            return await inter.response.send_message("No photos yet. Drop some in the chat first.", ephemeral=True)
-        await inter.response.send_message(settings_text(s), view=SettingsView(inter.user.id), ephemeral=True)
+        await open_name_form(inter)
 
     @discord.ui.button(label="Use upload form instead", emoji="🗃️", style=discord.ButtonStyle.secondary)
     async def form(self, inter: discord.Interaction, _):
@@ -571,10 +647,7 @@ class PhotosView(discord.ui.View):
 
     @discord.ui.button(label="Generate PDF", emoji="📄", style=discord.ButtonStyle.success)
     async def gen(self, inter: discord.Interaction, _):
-        s = sessions.get(inter.user.id)
-        if not s or not s.photos:
-            return await inter.response.edit_message(content="No photos left.", view=None)
-        await inter.response.edit_message(content=settings_text(s), view=SettingsView(inter.user.id))
+        await open_name_form(inter)
 
 
 class RemoveModal(discord.ui.Modal, title="Remove photos"):
@@ -612,9 +685,9 @@ class MoveModal(discord.ui.Modal, title="Move a photo"):
         await inter.response.edit_message(content=f"↕️ Moved photo {a} to position {b}.\n" + list_text(s), view=PhotosView())
 
 
-def settings_text(s: Session) -> str:
-    return (f"**Page options**: {plural(len(s.photos))} ready.\n"
-            "Pick your options, then hit **Next** to name the PDF and add a label.")
+def settings_text() -> str:
+    return ("**⚙️ Options**: saved as you change them and used every time you hit **Generate PDF**.\n"
+            "-# Photos you add from now on are pre-processed at this quality, so pick it before uploading.")
 
 
 def _select(placeholder: str, choices: dict, current: str, row: int) -> discord.ui.Select:
@@ -623,14 +696,13 @@ def _select(placeholder: str, choices: dict, current: str, row: int) -> discord.
 
 
 class SettingsView(discord.ui.View):
-    """Dropdowns for the page options. Changes are remembered for next time."""
+    """Quality and label style. Changes are remembered for next time (layout and order are in the name form)."""
 
     def __init__(self, user_id: int):
         super().__init__(timeout=900)
         p = get_prefs(user_id)
         for row, (key, placeholder, choices) in enumerate([
-            ("page", "Page layout", PAGE_CHOICES), ("size", "Quality", SIZE_CHOICES),
-            ("sort", "Page order", SORT_CHOICES), ("label_position", "Label position", POSITION_CHOICES),
+            ("size", "Quality", SIZE_CHOICES), ("label_position", "Label position", POSITION_CHOICES),
         ]):
             sel = _select(placeholder, choices, p[key], row)
             sel.callback = self._on_select(key, sel)
@@ -644,22 +716,22 @@ class SettingsView(discord.ui.View):
             await inter.response.edit_message(view=SettingsView(inter.user.id))
         return callback
 
-    @discord.ui.button(label="Label color", emoji="🎨", style=discord.ButtonStyle.secondary, row=4)
+    @discord.ui.button(label="Label color", emoji="🎨", style=discord.ButtonStyle.secondary, row=2)
     async def color_btn(self, inter: discord.Interaction, _):
         p = get_prefs(inter.user.id)
         colors = list(pdfmaker.COLORS)
         p["label_color"] = colors[(colors.index(p["label_color"]) + 1) % len(colors)]
         await inter.response.edit_message(view=SettingsView(inter.user.id))
 
-    @discord.ui.button(label="Font", emoji="🔤", style=discord.ButtonStyle.secondary, row=4)
+    @discord.ui.button(label="Font", emoji="🔤", style=discord.ButtonStyle.secondary, row=2)
     async def font_btn(self, inter: discord.Interaction, _):
         p = get_prefs(inter.user.id)
         p["label_font"] = "serif" if p["label_font"] == "sans" else "sans"
         await inter.response.edit_message(view=SettingsView(inter.user.id))
 
-    @discord.ui.button(label="Next: name it", emoji="➡️", style=discord.ButtonStyle.success, row=4)
+    @discord.ui.button(label="Generate PDF", emoji="📄", style=discord.ButtonStyle.success, row=2)
     async def next_btn(self, inter: discord.Interaction, _):
-        await inter.response.send_modal(NameModal(inter.user.id))
+        await open_name_form(inter)
 
 
 class NameModal(discord.ui.Modal, title="Name your PDF"):
@@ -670,10 +742,14 @@ class NameModal(discord.ui.Modal, title="Name your PDF"):
         self.label = discord.ui.TextInput(
             style=discord.TextStyle.paragraph, required=False, default=p["label"] or None, max_length=300,
             placeholder="PO 25OSPC055\n@ KOMO MAI DR.\nTAKEN 4/16/26")
+        self.page = _select("Page layout", PAGE_CHOICES, p["page"], None)
+        self.sort = _select("Page order", SORT_CHOICES, p["sort"], None)
         self.keep = discord.ui.Checkbox()
         self.add_item(discord.ui.Label(text="File name", description=".pdf is added for you", component=self.filename))
         self.add_item(discord.ui.Label(text="Label on every photo (optional)",
                                        description="Each line becomes a line in the label box", component=self.label))
+        self.add_item(discord.ui.Label(text="Page layout", component=self.page))
+        self.add_item(discord.ui.Label(text="Page order", component=self.sort))
         self.add_item(discord.ui.Label(text="Keep my photos after making it", component=self.keep))
 
     async def on_submit(self, inter: discord.Interaction):
@@ -684,6 +760,7 @@ class NameModal(discord.ui.Modal, title="Name your PDF"):
             return await inter.response.send_message("Already working on one, hang on.", ephemeral=True)
         p = get_prefs(inter.user.id)
         p["filename"], p["label"] = self.filename.value.strip() or "photos", self.label.value
+        p["page"], p["sort"] = (self.page.values or [p["page"]])[0], (self.sort.values or [p["sort"]])[0]
         orientation, fit = p["page"].split("|")
         opts = pdfmaker.Options(orientation, fit, p["size"], p["label"], p["label_position"], p["label_color"], p["label_font"])
         await inter.response.defer(thinking=True)

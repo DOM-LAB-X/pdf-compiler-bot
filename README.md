@@ -7,20 +7,23 @@ Send photos to the bot in Discord and get back one letter-size PDF. This is the 
 - Can sort by date taken. It reads the **Timemark** overlay with OCR, then EXIF, then falls back to upload time
 - Can stamp a label on every photo, with a choice of position, color and font (Arial or Times)
 - Stays under Discord's upload limit: if the PDF is too big it drops to a smaller size, then splits it into parts if it's still too big
-- **Saves nothing to disk.** The bot only remembers the Discord links to your photos. While it builds the PDF it downloads each photo into memory, then drops it.
+- **Saves nothing to disk.** Each photo is downloaded into memory as soon as you add it and shrunk to a page right away (the original is dropped), so the PDF is ready the moment you name it.
 
 ## Using it
 
 ### Button panel (easiest)
 
-Run **`/pdf panel`** once in a channel. It posts a panel with four buttons that anyone in the channel can use:
+Run **`/pdf panel`** once in a channel. It posts a panel with five buttons that anyone in the channel can use:
 
 | Button | What it does |
 |---|---|
 | 📤 **Add Photos** | Turns on collecting in that channel. Drag or paste your photos into the chat (fastest). There's also a **Use upload form instead** button |
 | 🗂️ **My Photos** | Shows your photos in page order, with **Remove…** and **Move…** |
-| 📄 **Generate PDF** | Dropdowns for layout, quality, page order and label position, plus label color and font buttons. **Next** asks for the file name and the label text (multi-line), then builds the PDF |
+| 📄 **Generate PDF** | Opens one form: file name, label text (multi-line), page layout, page order, keep photos. Submit and the PDF is built |
+| ⚙️ **Options** | Quality, label position, label color and font. Set quality *before* adding photos so they're pre-processed at it |
 | 🗑️ **Clear** | Starts over |
+
+Panels posted by an older version update themselves to the new buttons the first time someone clicks one.
 
 Each person has their own pile, so several people can use the same panel. Your last choices are remembered.
 
@@ -29,13 +32,14 @@ Each person has their own pile, so several people can use the same panel. Your l
 | | |
 |---|---|
 | **DM the bot photos** | They're collected automatically, up to 10 per message, across as many messages as you want |
-| `/pdf start` in a channel | Collect the photos *you* post in that channel (`/pdf stop` to turn it off) |
+| `/pdf start` in a channel | Collect the photos *you* post in that channel |
+| `/pdf stop` | Stops collecting there and opens the name form (same as **Generate PDF**), then makes the PDF |
 | Long-press a message → **Apps → Add photos to PDF** | Add photos someone else posted |
 | `/pdf list` · `/pdf move` · `/pdf remove 2,5-7` | Check and change the page order |
 | `/pdf make` | Build the PDF. Every option is optional. For a label use `PO 25OSPC055 \| @ KOMO MAI DR. \| TAKEN 4/16/26` (`\|` = new line) |
 | `/pdf clear` | Start over (this also happens automatically after `make` unless `keep: True`) |
 
-Each person has their own pile. A pile is forgotten after 12 idle hours or when the bot restarts. Don't delete the photo messages before you run `/pdf make`, because the bot downloads the photos from them at that point.
+Each person has their own pile. A pile is forgotten after 12 idle hours or when the bot restarts. If you change the quality to a higher setting after adding photos, or the pre-processing memory (`CACHE_MB`) is full, the bot downloads those photos again when building, so don't delete the photo messages until you have your PDF.
 
 ## One-time Discord setup (≈5 min)
 
@@ -77,5 +81,5 @@ GitHub Actions builds the zip and publishes the release.
 
 - **Upload limit:** bots can usually upload 10 MB per file (more in boosted servers). A batch over that is shrunk first, then split into `name_part1of3.pdf`, and so on.
 - **Dates:** Discord can strip EXIF data from uploaded images, so the reliable date source is the Timemark overlay burned into the photo. Photos with no readable date are sorted by when you sent them.
-- **Memory:** finished pages are held in RAM until the PDF is sent, about 0.1–0.3 MB per photo at the balanced size. Give the VM 2 GB or more.
+- **Memory:** pre-processed pages are held in RAM until the PDF is sent, about 0.1–0.3 MB per photo at balanced and 2–3 MB at original. `CACHE_MB` (default 1000) caps it across everyone. Give the VM 2 GB or more.
 - `pdfmaker.py` has no Discord code in it, so you can reuse it in other scripts.

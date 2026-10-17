@@ -1,6 +1,7 @@
 """Photos -> letter-size PDF. Python port of photos_to_pdf.html (no Discord code in here).
 Works entirely on in-memory bytes; nothing is written to disk."""
 import io
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -74,10 +75,14 @@ def can_open(data: bytes) -> bool:
         return False
 
 
-def open_rgb(data: bytes) -> Image.Image:
-    """Open any supported image upright (EXIF rotation applied), flattened onto white."""
+def open_rgb(data: bytes, max_dim: int | None = None) -> Image.Image:
+    """Open any supported image upright (EXIF rotation applied), flattened onto white.
+    With max_dim, big JPEGs are decoded at reduced scale (about 2x faster, still at least max_dim)."""
     with Image.open(io.BytesIO(data)) as im:
         im.seek(0)  # first frame of GIF / multi-page TIFF
+        if max_dim and im.format == "JPEG" and max(im.size) > max_dim:
+            k = max_dim / max(im.size)
+            im.draft("RGB", (math.ceil(im.width * k), math.ceil(im.height * k)))
         im = ImageOps.exif_transpose(im)
         if im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info):
             im = im.convert("RGBA")
@@ -247,14 +252,23 @@ class Page:
 
 
 def render_page(data: bytes, opts: Options) -> Page:
+    """data can be the original photo or an already-rendered Page.jpeg of the same or bigger size."""
     max_dim, quality = SIZE_PRESETS[opts.size]
-    im = open_rgb(data)
+    im = open_rgb(data, max_dim)
     if max_dim and max(im.size) > max_dim:
         im.thumbnail((max_dim, max_dim), Image.LANCZOS)
     im = burn_label(im, label_lines(opts.label), opts.label_position, opts.label_color, opts.label_font)
     buf = io.BytesIO()
     im.save(buf, "JPEG", quality=quality, optimize=True)
     return Page(buf.getvalue(), im.width, im.height)
+
+
+def can_derive(base_size: str | None, target_size: str) -> bool:
+    """Can a page rendered at base_size be reused for target_size (instead of the original photo)?"""
+    if base_size is None:
+        return False
+    base_dim, target_dim = SIZE_PRESETS[base_size][0], SIZE_PRESETS[target_size][0]
+    return base_dim is None or (target_dim is not None and target_dim <= base_dim)
 
 
 def pages_to_pdf(pages: list[Page], opts: Options, title: str = "photos") -> bytes:
