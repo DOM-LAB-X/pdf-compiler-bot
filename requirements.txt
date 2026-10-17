@@ -1,0 +1,6 @@
+discord.py==2.7.1
+pillow==13.0.0
+pillow-heif==1.8.1
+reportlab==5.0.1
+pytesseract==0.3.13
+python-dotenv==1.2.4

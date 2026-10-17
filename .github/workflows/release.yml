@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check VERSION matches tag
+        run: test "v$(cat VERSION)" = "$GITHUB_REF_NAME" || { echo "VERSION file says $(cat VERSION) but tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - name: Check Python syntax
+        run: python3 -m py_compile bot.py pdfmaker.py
+
+      - name: Build zip
+        run: |
+          mkdir pdf-compiler-bot
+          cp bot.py pdfmaker.py requirements.txt VERSION README.md .env.example *.bat update.ps1 pdf-compiler-bot/
+          zip -r "pdf-compiler-bot-$GITHUB_REF_NAME.zip" pdf-compiler-bot
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "pdf-compiler-bot-$GITHUB_REF_NAME.zip" --title "PDF Compiler Bot $GITHUB_REF_NAME" --generate-notes
